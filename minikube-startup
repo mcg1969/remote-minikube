@@ -1,0 +1,3 @@
+#!/bin/bash
+public_ip=$(curl http://169.254.169.254/latest/meta-data/public-ipv4)
+/usr/bin/minikube start --embed-certs --apiserver-ips=$public_ip

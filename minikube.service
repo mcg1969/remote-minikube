@@ -1,0 +1,17 @@
+[Unit]
+Description=Minikube Startup Service
+After=network-online.target containerd.service docker.service cri-docker.service
+Wants=network-online.target containerd.service docker.service cri-docker.service
+Requires=docker.socket cri-docker.socket containerd.service docker.service cri-docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/root
+ExecStart=/usr/bin/minikube-startup
+ExecReload=/usr/bin/minikube stop
+User=root
+Group=root
+
+[Install]
+WantedBy=multi-user.target

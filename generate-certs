@@ -1,0 +1,129 @@
+#!/bin/bash
+
+mkdir -p /etc/docker/{client,server} /root/.minikube
+cd /etc/docker
+
+while (( "$#" )); do
+    if [[ "$1" == --* ]]; then
+        name=$(echo $1 | sed 's@-@_@g')
+        eval "$name=yes"
+    fi
+    shift
+done
+args=$(set | sed -nE 's@^__([^=]*).*@\1@p' | paste -s -d ' ')
+echo "Docker/Kubernetes SSL Cerficate Manager"
+[ "$args" ] && echo "Running with arguments: $args" 
+
+if [ $__clean ]; then
+    rm -f *.cnf *.csr client/* server/* client.* server.* 2>/dev/null
+fi
+if [ $__superclean ]; then
+    rm -f ca.* *.cnf *.csr client/* server/* client.* server.*} 2>/dev/null
+    rm -f ~/.minikube/ca.* 2>/dev/null
+    rm -f ~/.minikube/profiles/*/{apiserver.*,client.*} 2>/dev/null
+    shift
+fi
+if [ $__quit ]; then
+    exit 0
+fi
+
+set -e
+
+function runcmd {
+    echo "$@" | fold -s | sed 's@^@ > @'
+    "$@" 2>&1 | sed 's@^@ | @'
+}
+
+if [[ ! -f ca-key.pem || ! -f ca.pem ]]; then
+    echo Generating CA: ca-key / ca.pem
+    rm -f server-cert.pem client-cert.pem 2>/dev/null
+    rm -f *.csr ~/.minikube/{ca.crt,ca.key} ~/.minikube/profiles/*/{apiserver.*,client.*} 2>/dev/null
+    echo keyUsage = keyEncipherment, digitalSignature, keyCertSign > ca.cnf
+    echo extendedKeyUsage = serverAuth, clientAuth >> ca.cnf
+    echo """[req]
+distinguished_name = req_distinguished_name
+x509_extensions = x509_req
+prompt = no
+[req_distinguished_name]
+CN = minikubeCA
+[x509_req]
+keyUsage = keyEncipherment, digitalSignature, keyCertSign
+extendedKeyUsage = serverAuth, clientAuth
+subjectKeyIdentifier = hash
+basicConstraints = critical,CA:true""" > ca.cnf
+    runcmd openssl req -nodes -newkey rsa:4096 -new -x509 -sha256 -keyout ca-key.pem -out ca.pem -config ca.cnf
+    ln ca.pem client/ca.pem
+    ln ca.pem server/ca.pem
+    ln ca.pem /root/.minikube/ca.crt
+    runcmd openssl rsa -in ca-key.pem -out ~/.minikube/ca.key
+else
+    echo "Using existing CA: ca-key.pem / ca.pem"
+fi
+runcmd openssl x509 -noout -in ca.pem -subject -issuer -dates
+echo ' |' private: $(openssl rsa -noout -modulus -in ca-key.pem | openssl md5 | cut -d ' ' -f 2)
+echo ' |' public: $(openssl x509 -noout -modulus -in ca.pem | openssl md5 | cut -d ' ' -f 2)
+
+for which in server client; do
+    keyfile=$which/key.pem
+    csrfile=$which.csr
+    cnffile=$which.cnf
+    crtfile=$which/cert.pem
+
+    if [ ! -f $keyfile ]; then
+        echo Generating $which private key: $keyfile
+        rm -f $crtfile
+        runcmd openssl genrsa -out $keyfile 4096
+    else
+        echo "Using existing $which private key: $keyfile"
+    fi
+
+    if [ $which = server ]; then
+        subjectAltName=IP:127.0.0.1
+        if [ ! $__no_private ]; then
+            private_ip=$(curl --silent http://169.254.169.254/latest/meta-data/local-ipv4)
+            subjectAltName="${subjectAltName},IP:${private_ip}"; 
+        fi
+        if [ ! $__no_public ]; then
+            public_ip=$(curl --silent http://169.254.169.254/latest/meta-data/public-ipv4)
+            subjectAltName="${subjectAltName},IP:${public_ip}";
+        fi
+        echo """subjectAltName = $subjectAltName""" > $cnffile.new
+    else
+        echo """extendedKeyUsage = clientAuth""" > $cnffile.new
+    fi
+
+    if [ ! -f $csrfile ]; then
+        echo Generating $which certificate request: $csrfile
+        rm -f $crtfile
+        runcmd openssl req -subj="/CN=minikube-$which" -sha256 -new -key $keyfile -out $csrfile
+    else
+        echo Using existing $which certificate request: $csrfile
+    fi
+    runcmd openssl req -in $csrfile -noout -subject
+
+    if [ ! -f $cnffile ]; then
+        echo Creating $which certificate configuration: $cnffile
+        rm -f $crtfile
+    elif [ ! -z "$(diff -q $cnffile $cnffile.new)" ]; then
+        echo Updating $which certificate configuration: $cnffile
+        rm -f $crtfle
+    else
+        echo "Using existing $which certificate configuration: $cnffile"
+    fi
+    mv $cnffile.new $cnffile
+    sed 's@^@ | @' $cnffile
+
+    if [ ! -f $crtfile ]; then
+        echo Generating $which certificate: $crtfile
+        runcmd openssl x509 -req -days 397 -in $csrfile -CA ca.pem -CAkey ca-key.pem \
+            -CAcreateserial -out $crtfile -extfile $cnffile
+    else
+        echo Using existing $which certficate: $crtfile
+    fi
+    runcmd openssl x509 -noout -in $crtfile -issuer -dates
+    echo ' |' private: $(openssl rsa -noout -modulus -in $keyfile | openssl md5 | cut -d ' ' -f 2)
+    echo ' |' public: $(openssl x509 -noout -modulus -in $crtfile | openssl md5 | cut -d ' ' -f 2)
+done
+
+chgrp docker -R /etc/docker
+chmod -R go-w,g+rX /etc/docker
