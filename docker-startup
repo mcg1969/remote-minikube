@@ -1,7 +1,21 @@
 #!/bin/bash
-/usr/bin/generate-certs | tee /var/log/generate-certs.log
-exec /usr/bin/dockerd -H fd:// -H tcp://0.0.0.0:2376 \
-    --containerd=/run/containerd/containerd.sock \
-    --tlsverify --tlscacert=/etc/docker/server/ca.pem \
-    --tlscert=/etc/docker/server/cert.pem \
-    --tlskey=/etc/docker/server/key.pem
+log=/var/log/docker-startup.log
+echo "Starting docker" | tee $log
+
+cmd=(/usr/bin/generate-certs)
+echo
+echo Running: "${cmd[@]}" | tee -a $log
+"${cmd[@]}" | tee -a $log
+
+cmd=(/usr/bin/dockerd --containerd=/run/containerd/containerd.sock -H fd://)
+if [ -f /etc/docker/server/cert.pem ]; then
+    echo "TLS certs found; starting docker with TCP" | tee -a $log
+    cmd+=(-H tcp://0.0.0.0:2376 \
+          --tlsverify --tlscacert=/etc/docker/server/ca.pem \
+          --tlscert=/etc/docker/server/cert.pem \
+          --tlskey=/etc/docker/server/key.pem)
+else
+    echo "TLS certs NOT found; starting local docker only" | tee -a $log
+fi
+echo Running: "${cmd[@]}" | tee -a $log
+exec "${cmd[@]}"

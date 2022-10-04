@@ -1,6 +1,9 @@
 #!/bin/bash
 
-mkdir -p /etc/docker/{client,server} /root/.minikube
+mkdir -p /etc/docker/{client,server}
+chgrp -fR docker /etc/docker
+chmod -fR g+rX /etc/docker
+find /etc/docker -type d -exec chmod g+s {} \;
 cd /etc/docker
 
 while (( "$#" )); do
@@ -13,15 +16,19 @@ done
 args=$(set | sed -nE 's@^__([^=]*).*@\1@p' | paste -s -d ' ')
 echo "Docker/Kubernetes SSL Cerficate Manager"
 [ "$args" ] && echo "Running with arguments: $args" 
-
-if [ $__clean ]; then
-    rm -f *.cnf *.csr client/* server/* client.* server.* 2>/dev/null
+if [ $__sanitized ]; then
+    __superclean=yes
+    __no_private=yes
+    __no_public=yes
 fi
 if [ $__superclean ]; then
-    rm -f ca.* *.cnf *.csr client/* server/* client.* server.*} 2>/dev/null
-    rm -f ~/.minikube/ca.* 2>/dev/null
-    rm -f ~/.minikube/profiles/*/{apiserver.*,client.*} 2>/dev/null
-    shift
+    # Remove the CA and all certificates generated with it
+    rm -f ca-key.* ca.* client/ca.* server/ca.* 2>/dev/null
+    __clean=yes
+fi
+if [ $__clean ]; then
+    # Keep the CA, but just generate new Docker server/client certs
+    rm -f client/* server/* client.* server.* 2>/dev/null
 fi
 if [ $__quit ]; then
     exit 0
@@ -52,10 +59,6 @@ extendedKeyUsage = serverAuth, clientAuth
 subjectKeyIdentifier = hash
 basicConstraints = critical,CA:true""" > ca.cnf
     runcmd openssl req -nodes -newkey rsa:4096 -new -x509 -sha256 -keyout ca-key.pem -out ca.pem -config ca.cnf
-    ln ca.pem client/ca.pem
-    ln ca.pem server/ca.pem
-    ln ca.pem /root/.minikube/ca.crt
-    runcmd openssl rsa -in ca-key.pem -out ~/.minikube/ca.key
 else
     echo "Using existing CA: ca-key.pem / ca.pem"
 fi
@@ -69,6 +72,10 @@ for which in server client; do
     cnffile=$which.cnf
     crtfile=$which/cert.pem
 
+    if [ ! -f $which/ca.pem ]; then
+        ln ca.pem $which/ca.pem
+    fi
+
     if [ ! -f $keyfile ]; then
         echo Generating $which private key: $keyfile
         rm -f $crtfile
@@ -81,21 +88,23 @@ for which in server client; do
         subjectAltName=IP:127.0.0.1
         if [ ! $__no_private ]; then
             private_ip=$(curl --silent http://169.254.169.254/latest/meta-data/local-ipv4)
-            subjectAltName="${subjectAltName},IP:${private_ip}"; 
+            subjectAltName="${subjectAltName},IP:${private_ip}"
         fi
         if [ ! $__no_public ]; then
             public_ip=$(curl --silent http://169.254.169.254/latest/meta-data/public-ipv4)
-            subjectAltName="${subjectAltName},IP:${public_ip}";
+            subjectAltName="${subjectAltName},IP:${public_ip}"
         fi
         echo """subjectAltName = $subjectAltName""" > $cnffile.new
+        subject="/CN=minikube-server"
     else
         echo """extendedKeyUsage = clientAuth""" > $cnffile.new
+        subject="/O=system:masters/CN=minikube-server"
     fi
 
     if [ ! -f $csrfile ]; then
         echo Generating $which certificate request: $csrfile
         rm -f $crtfile
-        runcmd openssl req -subj="/CN=minikube-$which" -sha256 -new -key $keyfile -out $csrfile
+        runcmd openssl req -subj=$subject -sha256 -new -key $keyfile -out $csrfile
     else
         echo Using existing $which certificate request: $csrfile
     fi
@@ -106,7 +115,7 @@ for which in server client; do
         rm -f $crtfile
     elif [ ! -z "$(diff -q $cnffile $cnffile.new)" ]; then
         echo Updating $which certificate configuration: $cnffile
-        rm -f $crtfle
+        rm -f $crtfile
     else
         echo "Using existing $which certificate configuration: $cnffile"
     fi
@@ -124,6 +133,3 @@ for which in server client; do
     echo ' |' private: $(openssl rsa -noout -modulus -in $keyfile | openssl md5 | cut -d ' ' -f 2)
     echo ' |' public: $(openssl x509 -noout -modulus -in $crtfile | openssl md5 | cut -d ' ' -f 2)
 done
-
-chgrp docker -R /etc/docker
-chmod -R go-w,g+rX /etc/docker

@@ -1,3 +1,67 @@
 #!/bin/bash
-public_ip=$(curl http://169.254.169.254/latest/meta-data/public-ipv4)
-/usr/bin/minikube start --embed-certs --apiserver-ips=$public_ip
+log=/var/log/minikube-startup.log
+echo "Starting minikube" | tee $log
+
+set -o pipefail
+
+user=$(basename $(dirname $(ls -d1 /home/*/.kube | tail -1)))
+ready=/home/$user/README.minikube
+echo """Minikube has not yet fully intialized.
+You can monitor progress by watching the logs:
+   tail -f /var/log/minikube-startup.log
+This README will be updated with connection instructios
+once the initialization process is complete.""" > $ready
+chown $user:$user $ready
+
+if [ ! -f /root/.minikube/ca.crt ]; then
+    echo "Copying CA certificate from Docker" | tee -a $log
+    mkdir -p /root/.minikube
+    cp /etc/docker/ca.pem /root/.minikube/ca.crt
+    openssl rsa -in /etc/docker/ca-key.pem -out /root/.minikube/ca.key
+fi
+
+private_ip=$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4)
+public_ip=$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4)
+echo "IP addresses: private $private_ip / public $public_ip" | tee -a $log
+
+unset KUBECONFIG
+echo
+cmd=(/usr/bin/minikube start --apiserver-ips="$private_ip,$public_ip" --wait=all)
+echo Running: "${cmd[@]}" | tee -a $log
+"${cmd[@]}" | tee -a $log
+
+cmd=(/usr/bin/minikube status)
+echo
+echo Running: "${cmd[@]}" | tee -a $log
+if ! "${cmd[@]}" | tee -a $log; then
+    echo "ERROR: Minikube did not successfully start." | tee -a $log
+    echo """The initialization of Minikube failed.
+To diagnose the problem, examine the logs:
+   cat /var/log/minikube-startup.log""" > $ready
+    chown $user:$user $ready
+    exit -1
+fi
+
+echo "Startup successful. Updating config files..." | tee -a $log
+cd /root/.kube
+rm -rf cache
+mv config config.internal
+sed -e "s@${private_ip}@${public_ip}@" \
+    -e "s@/root/.minikube/ca.crt@../.docker/ca.pem@" \
+    -e "s@/root/.minikube/profiles/minikube/client.crt@../.docker/cert.pem@" \
+    -e "s@/root/.minikube/profiles/minikube/client.key@../.docker/key.pem@" \
+    config.internal > config    
+chmod 640 config*
+
+echo """Docker and Kubernetes are running and available over the public IP
+address ${public_ip}. To access this cluster from a remote machine:
+- Establish SSH access from that machine to ${user}@${public_ip}.
+- Install an up-to-date version of the docker and kubectl clients.
+- Copy the TLS certificates and kubectl configuration:
+    scp -r ${user}@${public_ip}:{.kube,.docker} ~
+- Set these environment variables to access Docker:
+    export DOCKER_HOST=tcp://${public_ip}:2376
+    export DOCKER_TLS_VERIFY=1
+  It is recommended to save these in your ~/.profile or equivalent.""" > $ready
+chown $user:$user $ready
+echo "Done." | tee -a $log

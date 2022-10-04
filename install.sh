@@ -29,21 +29,21 @@ echo "# Minikube Installerator #"
 echo "##########################"
 
 if [ $UID != 0 ]; then
-    echo "ERROR: This script must be run as root" 1>2
+    echo "ERROR: This script must be run as root" 1>&2
     exit -1
 elif [ $SUDO_UID = 0 ]; then
-    echo "ERROR: This script must be run through sudo" 1>2
+    echo "ERROR: This script must be run through sudo" 1>&2
     exit -1
 elif [ ! -f /etc/debian_version ]; then
-    echo "ERROR: This script is intended to be run on debian" 1>2
+    echo "ERROR: This script is intended to be run on debian" 1>&2
     exit -1
 elif [ "$(cat /etc/debian_version | cut -d '.' -f 1)" != 11 ]; then
-    echo "WARNING: This script has only been tested on Debian 11 (Bullseye)" 1>2
+    echo "WARNING: This script has only been tested on Debian 11 (Bullseye)" 1>&2
 fi
 rel=$(lsb_release -cs)
 arch=$(dpkg --print-architecture)
 if [ "$arch" != "amd64" ]; then
-    echo "WARNING: This script has only been tested on AMD64 architectures" 1>2
+    echo "WARNING: This script has only been tested on AMD64 architectures" 1>&2
 fi
 
 public_ip=$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4)
@@ -90,8 +90,8 @@ done
 protec=$(sysctl fs.protected_regular | cut -d ' ' -f 3)
 if [[ "$protec" != "" && "$protec" != 0 ]]; then
     echo """
-Modifying system setting
-------------------------"""
+Permissions fix
+---------------"""
     runcmd sysctl -w fs.protected_regular=0
     runcmd sed -i -E 's@^(fs.protected_regular =).*@\1 0@' /lib/sysctl.d/protect-links.conf
 fi
@@ -120,7 +120,7 @@ url=https://download.docker.com/linux/debian
 runcmd apt-get install -y gnupg 
 runcmd mkdir -p $(dirname $ring)
 mycurl https://download.docker.com/linux/debian/gpg
-runcmd gpg --dearmor -o $ring < gpg
+runcmd gpg --dearmor --verbose -o $ring < gpg
 echo echo "deb [arch=$arch signed-by=$ring] $url $rel stable" '>' /etc/apt/sources.list.d/docker.list | indent '>'
 echo "deb [arch=$arch signed-by=$ring] $url $rel stable" > /etc/apt/sources.list.d/docker.list
 runcmd apt-get update -yq
@@ -140,29 +140,34 @@ runcmd dpkg -i cri-dockerd*
 runcmd mkdir -p /opt/cni/bin
 runcmd tar xvfz cni-plugins-*.tgz -C /opt/cni/bin
 runcmd tar xvfz crictl-*.tar.gz -C /usr/bin
-runcmd install -v minikube-linux-* /usr/bin/minikubes
+runcmd install -v minikube-linux-* /usr/bin/minikube
 runcmd install -v kubectl generate-certs docker-startup minikube-startup /usr/bin/
-runcmd cp override.conf /etc/systemd/system/docker.service.d/
 
 echo """
 Enable TLS access for docker
 ----------------------------"""
-runcmd generate-certs --no-private --no-public
-fname=/etc/systemd/system/docker.service.d/override.conf
-runcmd mkdir -p $(dirname $fname)
-runcmd cp docker.override $fname
+runcmd mkdir -p /etc/systemd/system/docker.service.d/
+runcmd cp docker-override.conf /etc/systemd/system/docker.service.d/
 runcmd systemctl daemon-reload
-runcmd systemctl restart docker.service
+runcmd ln -s /etc/docker/client /root/.docker
 
+# We are running minikube twice here, deliberately. The first
+# time downloads the resources and creates the cluster profile.
+# The second time exercises our startup script
 echo """
 Initialize minikube
 -------------------"""
-runcmd minikube start --driver=none --cni=bridge --wait=all \
-    --kubernetes-version=${kubernetes_version} \
-    --embed-certs --apiserver-ips=${public_ip}
+runcmd mkdir /root/{.kube,.minikube}
+runcmd chgrp docker /root/{.kube,.minikube}
+runcmd chmod g+rxs /root/{.kube,.minikube}
+runcmd minikube start --driver=none --cni=bridge \
+    --kubernetes-version=${kubernetes_version} --download-only
 runcmd cp minikube.service /lib/systemd/system/
 runcmd systemctl daemon-reload
-runcmd enable minikube.service
+export='export KUBECONFIG=$HOME/.kube/config.internal'
+echo "$export" > /etc/profile.d/kubeconfig.sh
+echo "$export" >> /root/.bashrc
+runcmd systemctl enable minikube
 
 uuid=$SUDO_UID
 user=$(id -un $SUDO_UID)
@@ -171,7 +176,18 @@ Enable access for $user($uuid)
 ------------------------------"""
 runcmd usermod -a -G docker $user
 runcmd chmod +x /root
-runcmd chgrp -R docker /root/.kube
-runcmd chmod -R g=u,g+s /root/.kube
-runcmd rm -rf ~$user/.kube
-runcmd ln -s /root/.kube ~$user/
+runcmd ln -s /root/.kube /home/$user/
+runcmd ln -s /root/.minikube /home/$user/
+runcmd ln -s /root/.docker /home/$user/
+runcmd rm -rf /root/.kube/cache
+runcmd rm *
+
+echo """
+Installation is complete, but certificates have not been
+generated, and Minikube has not been fully configured.
+- If you wish to turn this VM into an AMI, shut it
+  down now without making further changes.
+- If you wish to use this VM, reboot it or run the
+  following commands:
+     systemctl restart docker
+     minikube-startup"""
