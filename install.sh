@@ -13,15 +13,20 @@ function indent {
 }
 
 function runcmd {
-    echo "$@" | indent '>'
-    "$@" 2>&1 | indent
-}
-
-function mycurl {
-    echo $1 | indent '>'
-    result=$(curl -OLs --write-out "%{http_code}" "$1")
-    echo "return code: $result" | indent
-    [ $result = 200 ]
+    if [ "$1" = "-o" ]; then
+        ofile=$2
+        shift 2
+        echo "$@" ">" $ofile | indent '>'
+        { "$@" >$ofile 2>&3; } 3>&1 | indent ':'
+    elif [ "$1" = "-a" ]; then
+        local ofile=$2
+        shift 2
+        echo "$@" ">>" $ofile | indent '>'
+        { "$@" >>$ofile 2>&3; } 3>&1 | indent ':'
+    else
+        echo "$@" | indent '>'
+        { { "$@" 2>&3 | indent '|'; } 3>&1 1>&4 | indent '!'; } 4>&1
+    fi
 }
 
 echo "##########################"
@@ -69,15 +74,19 @@ https://github.com/kubernetes/minikube/releases/download/v${minkube_version}/min
 https://github.com/Mirantis/cri-dockerd/releases/download/v${cri_dockerd_version}/cri-dockerd_${cri_dockerd_version}.3-0.debian-${rel}_${arch}.deb
 https://github.com/kubernetes-sigs/cri-tools/releases/download/v${crictl_version}/crictl-v${crictl_version}-linux-${arch}.tar.gz
 https://github.com/containernetworking/plugins/releases/download/v${cni_version}/cni-plugins-linux-${arch}-v${cni_version}.tgz
+https://download.docker.com/linux/debian/gpg
 """
 
 echo """
 Downloading assets
 ------------------"""
 for url in $URLS; do
-    if ! mycurl $url; then
+    echo $url | indent '>'
+    result=$(curl -OLs --write-out "%{http_code}" "$url")
+    echo "return code: $result" | indent
+    if [ $result != 200 ]; then
         echo "ERROR: download failed"
-        exit -1
+        # exit -1
     fi
 done
 
@@ -107,6 +116,11 @@ export DEBIAN_FRONTEND=noninteractive
 export DEBIAN_PRIORITY=critical
 runcmd apt-get update -yq
 runcmd apt-get upgrade -yq
+runcmd apt-get install -yq iptables-persistent arptables ebtables conntrack nfs-kernel-server dnsutils jq
+runcmd update-alternatives --set iptables /usr/sbin/iptables-legacy
+runcmd update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy
+runcmd update-alternatives --set arptables /usr/sbin/arptables-legacy
+runcmd update-alternatives --set ebtables /usr/sbin/ebtables-legacy
 
 #
 # Install docker and containerd.io
@@ -119,15 +133,17 @@ ring=/etc/apt/keyrings/docker.gpg
 url=https://download.docker.com/linux/debian
 runcmd apt-get install -y gnupg 
 runcmd mkdir -p $(dirname $ring)
-mycurl https://download.docker.com/linux/debian/gpg
 runcmd gpg --dearmor --verbose -o $ring < gpg
-echo echo "deb [arch=$arch signed-by=$ring] $url $rel stable" '>' /etc/apt/sources.list.d/docker.list | indent '>'
-echo "deb [arch=$arch signed-by=$ring] $url $rel stable" > /etc/apt/sources.list.d/docker.list
+runcmd -o /etc/apt/sources.list.d/docker.list echo "deb [arch=$arch signed-by=$ring] $url $rel stable"
 runcmd apt-get update -yq
 runcmd apt-get install -yq docker-ce docker-ce-cli containerd.io
+iptables -I DOCKER-USER -j ACCEPT
+runcmd -o /etc/iptables/rules.v4 iptables-save
+runcmd docker pull cryptexlabs/minikube-ingress-dns:0.3.0
 
 # Minikube requirements:
-# - conntrack
+# - legacy iptables
+# - conntrack (installed above)
 # - cni plugins (only need bridge, actually)
 # - crictrl
 # - cri-dockerd
@@ -135,7 +151,6 @@ runcmd apt-get install -yq docker-ce docker-ce-cli containerd.io
 echo """
 Installing additional components
 --------------------------------"""
-runcmd apt-get install -yq conntrack
 runcmd dpkg -i cri-dockerd*
 runcmd mkdir -p /opt/cni/bin
 runcmd tar xvfz cni-plugins-*.tgz -C /opt/cni/bin
@@ -157,16 +172,18 @@ runcmd ln -s /etc/docker/client /root/.docker
 echo """
 Initialize minikube
 -------------------"""
-runcmd mkdir /root/{.kube,.minikube}
-runcmd chgrp docker /root/{.kube,.minikube}
-runcmd chmod g+rxs /root/{.kube,.minikube}
+runcmd mkdir -p /root/.kube /root/.minikube/extra
+runcmd cp ingress-dns.tmpl coredns.tmpl /root/.minikube/extra/
+runcmd chgrp docker /root/.kube
+runcmd chmod g+rxs /root/.kube
 runcmd minikube start --driver=none --cni=bridge \
-    --kubernetes-version=${kubernetes_version} --download-only
+    --kubernetes-version=${kubernetes_version} \
+    --addons=ingress --download-only
 runcmd cp minikube.service /lib/systemd/system/
 runcmd systemctl daemon-reload
 export='export KUBECONFIG=$HOME/.kube/config.internal'
-echo "$export" > /etc/profile.d/kubeconfig.sh
-echo "$export" >> /root/.bashrc
+runcmd -o /etc/profile.d/kubeconfig.sh echo "$export"
+runcmd -a /root/.bashrc echo "$export"
 runcmd systemctl enable minikube
 
 uuid=$SUDO_UID
@@ -177,7 +194,6 @@ Enable access for $user($uuid)
 runcmd usermod -a -G docker $user
 runcmd chmod +x /root
 runcmd ln -s /root/.kube /home/$user/
-runcmd ln -s /root/.minikube /home/$user/
 runcmd ln -s /root/.docker /home/$user/
 runcmd rm -rf /root/.kube/cache
 runcmd rm *
@@ -189,5 +205,5 @@ generated, and Minikube has not been fully configured.
   down now without making further changes.
 - If you wish to use this VM, reboot it or run the
   following commands:
-     systemctl restart docker
-     minikube-startup"""
+     sudo systemctl restart docker
+     sudo minikube-startup"""
